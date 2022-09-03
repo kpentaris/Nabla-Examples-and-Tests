@@ -36,8 +36,8 @@ public:
     std::array<video::IGPUQueue*, CommonAPI::InitOutput::MaxQueuesCount> queues;
     nbl::core::smart_refctd_ptr<nbl::video::ISwapchain> swapchain;
     nbl::core::smart_refctd_ptr<nbl::video::IGPURenderpass> renderpass;
-    std::array<nbl::core::smart_refctd_ptr<nbl::video::IGPUFramebuffer>, CommonAPI::InitOutput::MaxSwapChainImageCount> fbo;
-    std::array<nbl::core::smart_refctd_ptr<nbl::video::IGPUCommandPool>, CommonAPI::InitOutput::MaxQueuesCount> commandPools;
+    nbl::core::smart_refctd_dynamic_array<nbl::core::smart_refctd_ptr<nbl::video::IGPUFramebuffer>> fbo;
+    std::array<std::array<nbl::core::smart_refctd_ptr<nbl::video::IGPUCommandPool>, CommonAPI::InitOutput::MaxFramesInFlight>, CommonAPI::InitOutput::MaxQueuesCount> commandPools;
     nbl::core::smart_refctd_ptr<nbl::system::ISystem> system;
     nbl::core::smart_refctd_ptr<nbl::asset::IAssetManager> assetManager;
     nbl::video::IGPUObjectFromAssetConverter::SParams cpu2gpuParams;
@@ -66,6 +66,7 @@ public:
     
     core::smart_refctd_ptr<video::IQueryPool> occlusionQueryPool;
     core::smart_refctd_ptr<video::IQueryPool> timestampQueryPool;
+    nbl::video::ISwapchain::SCreationParams m_swapchainCreationParams;
 
     uint32_t acquiredNextFBO = {};
     int resourceIx = -1;
@@ -102,7 +103,7 @@ public:
     {
         for (int i = 0; i < f.size(); i++)
         {
-            fbo[i] = core::smart_refctd_ptr(f[i]);
+            fbo->begin()[i] = core::smart_refctd_ptr(f[i]);
         }
     }
     void setSwapchain(core::smart_refctd_ptr<video::ISwapchain>&& s) override
@@ -111,7 +112,7 @@ public:
     }
     uint32_t getSwapchainImageCount() override
     {
-        return SC_IMG_COUNT;
+        return swapchain->getImageCount();
     }
     virtual nbl::asset::E_FORMAT getDepthFormat() override
     {
@@ -141,30 +142,47 @@ public:
 
     void onAppInitialized_impl() override
     {
-        CommonAPI::InitOutput initOutput;
-
         const auto swapchainImageUsage = static_cast<asset::IImage::E_USAGE_FLAGS>(asset::IImage::EUF_COLOR_ATTACHMENT_BIT | asset::IImage::EUF_TRANSFER_SRC_BIT);
-        const video::ISurface::SFormat surfaceFormat(asset::EF_R8G8B8A8_SRGB, asset::ECP_SRGB, asset::EOTF_sRGB);
+        CommonAPI::InitParams initParams;
+        initParams.window = core::smart_refctd_ptr(window);
+        initParams.apiType = video::EAT_VULKAN;
+        initParams.appName = { "03.MeshLoaders" };
+        initParams.framesInFlight = FRAMES_IN_FLIGHT;
+        initParams.windowWidth = WIN_W;
+        initParams.windowHeight = WIN_H;
+        initParams.swapchainImageCount = SC_IMG_COUNT;
+        initParams.swapchainImageUsage = swapchainImageUsage;
+        initParams.depthFormat = nbl::asset::EF_D32_SFLOAT;
+        auto initOutput = CommonAPI::InitWithDefaultExt(std::move(initParams));
 
-        CommonAPI::InitWithDefaultExt(initOutput, video::EAT_VULKAN, "SubpassBaking", WIN_W, WIN_H, SC_IMG_COUNT, swapchainImageUsage, surfaceFormat, nbl::asset::EF_D32_SFLOAT);
-        window = std::move(initOutput.window);
+        window = std::move(initParams.window);
+        windowCb = std::move(initParams.windowCb);
         apiConnection = std::move(initOutput.apiConnection);
         surface = std::move(initOutput.surface);
-        physicalDevice = std::move(initOutput.physicalDevice);
+        utilities = std::move(initOutput.utilities);
         logicalDevice = std::move(initOutput.logicalDevice);
+        physicalDevice = initOutput.physicalDevice;
         queues = std::move(initOutput.queues);
-        swapchain = std::move(initOutput.swapchain);
-        renderpass = std::move(initOutput.renderpass);
-        fbo = std::move(initOutput.fbo);
+        renderpass = std::move(initOutput.renderToSwapchainRenderpass);
         commandPools = std::move(initOutput.commandPools);
+        system = std::move(initOutput.system);
         assetManager = std::move(initOutput.assetManager);
+        cpu2gpuParams = std::move(initOutput.cpu2gpuParams);
         logger = std::move(initOutput.logger);
         inputSystem = std::move(initOutput.inputSystem);
-        system = std::move(initOutput.system);
-        windowCb = std::move(initOutput.windowCb);
-        cpu2gpuParams = std::move(initOutput.cpu2gpuParams);
-        utilities = std::move(initOutput.utilities);
-        
+        m_swapchainCreationParams = std::move(initOutput.swapchainCreationParams);
+
+        CommonAPI::createSwapchain(std::move(logicalDevice), m_swapchainCreationParams, WIN_W, WIN_H, swapchain);
+        assert(swapchain);
+        fbo = CommonAPI::createFBOWithSwapchainImages(
+            swapchain->getImageCount(), WIN_W, WIN_H,
+            logicalDevice, swapchain, renderpass,
+            nbl::asset::EF_D32_SFLOAT
+        );
+
+        auto defaultGraphicsCommandPool = commandPools[CommonAPI::InitOutput::EQT_GRAPHICS][0];
+        auto defaultTransferUpCommandPool = commandPools[CommonAPI::InitOutput::EQT_TRANSFER_UP][0];
+
         // Occlusion Query
         {
             video::IQueryPool::SCreationParams queryPoolCreationParams = {};
@@ -237,17 +255,18 @@ public:
 
             auto descriptorPool = logicalDevice->createDescriptorPoolForDSLayouts(video::IDescriptorPool::ECF_NONE, &gpuds1layout.get(), &gpuds1layout.get() + 1);
 
-            auto ubomemreq = logicalDevice->getDeviceLocalGPUMemoryReqs();
-            ubomemreq.vulkanReqs.size = neededDS1UBOsz;
 
             video::IGPUBuffer::SCreationParams cameraUBOCreationParams;
-            cameraUBOCreationParams.usage = static_cast<asset::IBuffer::E_USAGE_FLAGS>(asset::IBuffer::EUF_UNIFORM_BUFFER_BIT | asset::IBuffer::EUF_TRANSFER_DST_BIT);
-            cameraUBOCreationParams.canUpdateSubRange = true;
-            cameraUBOCreationParams.sharingMode = asset::E_SHARING_MODE::ESM_EXCLUSIVE;
+            cameraUBOCreationParams.usage = static_cast<asset::IBuffer::E_USAGE_FLAGS>(asset::IBuffer::EUF_UNIFORM_BUFFER_BIT | asset::IBuffer::EUF_TRANSFER_DST_BIT | asset::IBuffer::EUF_INLINE_UPDATE_VIA_CMDBUF);
             cameraUBOCreationParams.queueFamilyIndexCount = 0u;
             cameraUBOCreationParams.queueFamilyIndices = nullptr;
+            cameraUBOCreationParams.size = neededDS1UBOsz;
+            cameraUBO = logicalDevice->createBuffer(std::move(cameraUBOCreationParams));
 
-            cameraUBO = logicalDevice->createGPUBufferOnDedMem(cameraUBOCreationParams, ubomemreq);
+            auto ubomemreq = cameraUBO->getMemoryReqs();
+            ubomemreq.memoryTypeBits &= logicalDevice->getPhysicalDevice()->getDeviceLocalMemoryTypeBits();
+            logicalDevice->allocate(ubomemreq, cameraUBO.get());
+
             perCameraDescSet = logicalDevice->createDescriptorSet(descriptorPool.get(), std::move(gpuds1layout));
             {
                 video::IGPUDescriptorSet::SWriteDescriptorSet write;
@@ -281,7 +300,8 @@ public:
             cpu2gpuParams.waitForCreationToComplete();
         }
 
-        logicalDevice->createCommandBuffers(commandPools[CommonAPI::InitOutput::EQT_GRAPHICS].get(), video::IGPUCommandBuffer::EL_SECONDARY, 1u, &bakedCommandBuffer);
+        
+        logicalDevice->createCommandBuffers(defaultGraphicsCommandPool.get(), video::IGPUCommandBuffer::EL_SECONDARY, 1u, &bakedCommandBuffer);
         video::IGPUCommandBuffer::SInheritanceInfo inheritanceInfo = {};
         inheritanceInfo.renderpass = renderpass;
         inheritanceInfo.subpass = 0; // this should probably be kSubpassIx?
@@ -289,7 +309,7 @@ public:
         inheritanceInfo.occlusionQueryEnable = true;
         // inheritanceInfo.queryFlags = ;
 
-        bakedCommandBuffer->begin(video::IGPUCommandBuffer::EU_RENDER_PASS_CONTINUE_BIT | video::IGPUCommandBuffer::EU_SIMULTANEOUS_USE_BIT, &inheritanceInfo);
+        bakedCommandBuffer->begin((video::IGPUCommandBuffer::E_USAGE)(video::IGPUCommandBuffer::EU_RENDER_PASS_CONTINUE_BIT | video::IGPUCommandBuffer::EU_SIMULTANEOUS_USE_BIT), &inheritanceInfo);
         asset::SViewport viewport;
         viewport.minDepth = 1.f;
         viewport.maxDepth = 0.f;
@@ -410,17 +430,21 @@ public:
                 auto upQueue = queues[decltype(initOutput)::EQT_TRANSFER_UP];
                 auto fence = logicalDevice->createFence(video::IGPUFence::ECF_UNSIGNALED);
                 core::smart_refctd_ptr<video::IGPUCommandBuffer> tferCmdBuf;
-                logicalDevice->createCommandBuffers(commandPools[decltype(initOutput)::EQT_TRANSFER_UP].get(), video::IGPUCommandBuffer::EL_PRIMARY, 1u, &tferCmdBuf);
-                tferCmdBuf->begin(IGPUCommandBuffer::EU_NONE); // TODO some one time submit bit or something
+                logicalDevice->createCommandBuffers(defaultTransferUpCommandPool.get(), video::IGPUCommandBuffer::EL_PRIMARY, 1u, &tferCmdBuf);
+                tferCmdBuf->begin(video::IGPUCommandBuffer::EU_ONE_TIME_SUBMIT_BIT);
                 {
                     auto* ppHandler = utilities->getDefaultPropertyPoolHandler();
                     // if we did multiple transfers, we'd reuse the scratch
                     asset::SBufferBinding<video::IGPUBuffer> scratch;
                     {
                         video::IGPUBuffer::SCreationParams scratchParams = {};
-                        scratchParams.canUpdateSubRange = true;
-                        scratchParams.usage = core::bitflag(video::IGPUBuffer::EUF_TRANSFER_DST_BIT) | video::IGPUBuffer::EUF_STORAGE_BUFFER_BIT;
-                        scratch = { 0ull,logicalDevice->createDeviceLocalGPUBufferOnDedMem(scratchParams,ppHandler->getMaxScratchSize()) };
+                        scratchParams.usage = core::bitflag(video::IGPUBuffer::EUF_TRANSFER_DST_BIT) | video::IGPUBuffer::EUF_STORAGE_BUFFER_BIT | video::IGPUBuffer::EUF_INLINE_UPDATE_VIA_CMDBUF;
+                        scratchParams.size = ppHandler->getMaxScratchSize();
+                        auto scratchBuff = logicalDevice->createBuffer(std::move(scratchParams));
+                        auto memReqs = scratchBuff->getMemoryReqs();
+                        memReqs.memoryTypeBits &= logicalDevice->getPhysicalDevice()->getDeviceLocalMemoryTypeBits();
+                        logicalDevice->allocate(memReqs, scratchBuff.get());
+                        scratch = { 0ull,scratchBuff };
                         scratch.buffer->setObjectDebugName("Scratch Buffer");
                     }
                     auto* pRequest = &request;
@@ -453,15 +477,15 @@ public:
         bakedCommandBuffer->end();
 
         core::vectorSIMDf cameraPosition(0, 5, -10);
-        matrix4SIMD projectionMatrix = matrix4SIMD::buildProjectionMatrixPerspectiveFovLH(core::radians(60.0f), float(WIN_W) / WIN_H, 2.f, 4000.f);
+        matrix4SIMD projectionMatrix = matrix4SIMD::buildProjectionMatrixPerspectiveFovLH(core::radians(60.0f), video::ISurface::getTransformedAspectRatio(swapchain->getPreTransform(), WIN_W, WIN_H), 2.f, 4000.f);
         camera = Camera(cameraPosition, core::vectorSIMDf(0, 0, 0), projectionMatrix, 10.f, 1.f);
 
         oracle.reportBeginFrameRecord();
 
-        logicalDevice->createCommandBuffers(commandPools[CommonAPI::InitOutput::EQT_GRAPHICS].get(), video::IGPUCommandBuffer::EL_PRIMARY, FRAMES_IN_FLIGHT, commandBuffers);
-
-        for (uint32_t i = 0u; i < FRAMES_IN_FLIGHT; i++)
-        {
+        const auto& graphicsCommandPools = commandPools[CommonAPI::InitOutput::EQT_GRAPHICS];
+		for (uint32_t i = 0u; i < FRAMES_IN_FLIGHT; i++)
+		{
+			logicalDevice->createCommandBuffers(graphicsCommandPools[i].get(), video::IGPUCommandBuffer::EL_PRIMARY, 1, commandBuffers+i);
             imageAcquire[i] = logicalDevice->createSemaphore();
             renderFinished[i] = logicalDevice->createSemaphore();
         }
@@ -469,7 +493,7 @@ public:
 
     void onAppTerminated_impl() override
     {
-        const auto& fboCreationParams = fbo[acquiredNextFBO]->getCreationParameters();
+        const auto& fboCreationParams = fbo->begin()[acquiredNextFBO]->getCreationParameters();
         auto gpuSourceImageView = fboCreationParams.attachments[0];
 
         bool status = ext::ScreenShot::createScreenShot(
@@ -479,7 +503,7 @@ public:
             gpuSourceImageView.get(),
             assetManager.get(),
             "ScreenShot.png",
-            asset::EIL_PRESENT_SRC,
+            asset::IImage::EL_PRESENT_SRC,
             static_cast<asset::E_ACCESS_FLAGS>(0u));
 
         assert(status);
@@ -503,7 +527,7 @@ public:
 
         //
         commandBuffer->reset(nbl::video::IGPUCommandBuffer::ERF_RELEASE_RESOURCES_BIT);
-        commandBuffer->begin(IGPUCommandBuffer::EU_NONE);
+        commandBuffer->begin(video::IGPUCommandBuffer::EU_ONE_TIME_SUBMIT_BIT);  // TODO: Reset Frame's CommandPool
 
         // late latch input
         const auto nextPresentationTimestamp = oracle.acquireNextImage(swapchain.get(), imageAcquire[resourceIx].get(), nullptr, &acquiredNextFBO);
@@ -522,7 +546,10 @@ public:
         // update camera
         {
             const auto& viewMatrix = camera.getViewMatrix();
-            const auto& viewProjectionMatrix = camera.getConcatenatedMatrix();
+            const auto& viewProjectionMatrix = matrix4SIMD::concatenateBFollowedByAPrecisely(
+                video::ISurface::getSurfaceTransformationMatrix(swapchain->getPreTransform()), 
+                camera.getConcatenatedMatrix()
+            );
 
             const size_t camUboSize = cameraUBO->getSize();
             core::vector<uint8_t> uboData(camUboSize);
@@ -576,7 +603,7 @@ public:
                 clear[1].depthStencil.depth = 0.f;
 
                 beginInfo.clearValueCount = 2u;
-                beginInfo.framebuffer = fbo[acquiredNextFBO];
+                beginInfo.framebuffer = fbo->begin()[acquiredNextFBO];
                 beginInfo.renderpass = renderpass;
                 beginInfo.renderArea = area;
                 beginInfo.clearValues = clear;
@@ -596,7 +623,7 @@ public:
             commandBuffer->end();
         }
 
-        CommonAPI::Submit(logicalDevice.get(), swapchain.get(), commandBuffer.get(), queues[CommonAPI::InitOutput::EQT_GRAPHICS], imageAcquire[resourceIx].get(), renderFinished[resourceIx].get(), fence.get());
+        CommonAPI::Submit(logicalDevice.get(), commandBuffer.get(), queues[CommonAPI::InitOutput::EQT_GRAPHICS], imageAcquire[resourceIx].get(), renderFinished[resourceIx].get(), fence.get());
         CommonAPI::Present(logicalDevice.get(), swapchain.get(), queues[CommonAPI::InitOutput::EQT_GRAPHICS], renderFinished[resourceIx].get(), acquiredNextFBO);
 
         getAndLogQueryPoolResults();

@@ -60,8 +60,8 @@ public:
 	std::array<nbl::video::IGPUQueue*, CommonAPI::InitOutput::MaxQueuesCount> queues = { nullptr, nullptr, nullptr, nullptr };
 	nbl::core::smart_refctd_ptr<nbl::video::ISwapchain> swapchain;
 	nbl::core::smart_refctd_ptr<nbl::video::IGPURenderpass> renderpass;
-	std::array<nbl::core::smart_refctd_ptr<nbl::video::IGPUFramebuffer>, CommonAPI::InitOutput::MaxSwapChainImageCount> fbo;
-	std::array<nbl::core::smart_refctd_ptr<nbl::video::IGPUCommandPool>, CommonAPI::InitOutput::MaxQueuesCount> commandPools; // TODO: Multibuffer and reset the commandpools
+	nbl::core::smart_refctd_dynamic_array<nbl::core::smart_refctd_ptr<nbl::video::IGPUFramebuffer>> fbo;
+	std::array<std::array<nbl::core::smart_refctd_ptr<nbl::video::IGPUCommandPool>, CommonAPI::InitOutput::MaxFramesInFlight>, CommonAPI::InitOutput::MaxQueuesCount> commandPools; // TODO: Multibuffer and reset the commandpools
 	nbl::core::smart_refctd_ptr<nbl::system::ISystem> system;
 	nbl::core::smart_refctd_ptr<nbl::asset::IAssetManager> assetManager;
 	nbl::video::IGPUObjectFromAssetConverter::SParams cpu2gpuParams;
@@ -83,6 +83,8 @@ public:
 	core::smart_refctd_ptr<video::IGPUSemaphore> imageAcquire[FRAMES_IN_FLIGHT] = { nullptr };
 	core::smart_refctd_ptr<video::IGPUSemaphore> renderFinished[FRAMES_IN_FLIGHT] = { nullptr };
 	core::smart_refctd_ptr<video::IGPUCommandBuffer> commandBuffers[FRAMES_IN_FLIGHT];
+
+	nbl::video::ISwapchain::SCreationParams m_swapchainCreationParams;
 	
 	CommonAPI::InputSystem::ChannelReader<ui::IMouseEventChannel> mouse;
 	CommonAPI::InputSystem::ChannelReader<ui::IKeyboardEventChannel> keyboard;
@@ -140,7 +142,7 @@ public:
 	{
 		for (int i = 0; i < f.size(); i++)
 		{
-			fbo[i] = core::smart_refctd_ptr(f[i]);
+			fbo->begin()[i] = core::smart_refctd_ptr(f[i]);
 		}
 	}
 	void setSwapchain(core::smart_refctd_ptr<video::ISwapchain>&& s) override
@@ -149,7 +151,7 @@ public:
 	}
 	uint32_t getSwapchainImageCount() override
 	{
-		return SC_IMG_COUNT;
+		return swapchain->getImageCount();
 	}
 	virtual nbl::asset::E_FORMAT getDepthFormat() override
 	{
@@ -160,31 +162,43 @@ public:
 
 	void onAppInitialized_impl() override
 	{
-		CommonAPI::InitOutput initOutput;
-        initOutput.window = core::smart_refctd_ptr(window);
-        initOutput.system = core::smart_refctd_ptr(system);
-
 		const auto swapchainImageUsage = static_cast<asset::IImage::E_USAGE_FLAGS>(asset::IImage::EUF_COLOR_ATTACHMENT_BIT);
-		const video::ISurface::SFormat surfaceFormat(asset::EF_R8G8B8A8_SRGB, asset::ECP_COUNT, asset::EOTF_UNKNOWN);
+		CommonAPI::InitParams initParams;
+		initParams.window = core::smart_refctd_ptr(window);
+		initParams.apiType = video::EAT_VULKAN;
+		initParams.appName = { "05.NablaTutorialExample" };
+		initParams.framesInFlight = FRAMES_IN_FLIGHT;
+		initParams.windowWidth = WIN_W;
+		initParams.windowHeight = WIN_H;
+		initParams.swapchainImageCount = SC_IMG_COUNT;
+		initParams.swapchainImageUsage = swapchainImageUsage;
+		initParams.depthFormat = nbl::asset::EF_D32_SFLOAT;
+		auto initOutput = CommonAPI::InitWithDefaultExt(std::move(initParams));
 
-        CommonAPI::InitWithDefaultExt(initOutput, video::EAT_VULKAN, "NablaTutorialExample", WIN_W, WIN_H, SC_IMG_COUNT, swapchainImageUsage, surfaceFormat, nbl::asset::EF_D32_SFLOAT);
-		window = std::move(initOutput.window);
-		windowCb = std::move(initOutput.windowCb);
+		window = std::move(initParams.window);
+		windowCb = std::move(initParams.windowCb);
 		apiConnection = std::move(initOutput.apiConnection);
 		surface = std::move(initOutput.surface);
 		utilities = std::move(initOutput.utilities);
 		logicalDevice = std::move(initOutput.logicalDevice);
 		physicalDevice = initOutput.physicalDevice;
 		queues = std::move(initOutput.queues);
-		swapchain = std::move(initOutput.swapchain);
-		renderpass = std::move(initOutput.renderpass);
-		fbo = std::move(initOutput.fbo);
+		renderpass = std::move(initOutput.renderToSwapchainRenderpass);
 		commandPools = std::move(initOutput.commandPools);
 		system = std::move(initOutput.system);
 		assetManager = std::move(initOutput.assetManager);
 		cpu2gpuParams = std::move(initOutput.cpu2gpuParams);
 		logger = std::move(initOutput.logger);
 		inputSystem = std::move(initOutput.inputSystem);
+		m_swapchainCreationParams = std::move(initOutput.swapchainCreationParams);
+
+		CommonAPI::createSwapchain(std::move(logicalDevice), m_swapchainCreationParams, WIN_W, WIN_H, swapchain);
+		assert(swapchain);
+		fbo = CommonAPI::createFBOWithSwapchainImages(
+			swapchain->getImageCount(), WIN_W, WIN_H,
+			logicalDevice, swapchain, renderpass,
+			nbl::asset::EF_D32_SFLOAT
+		);
 
 		gpuTransferFence = logicalDevice->createFence(static_cast<video::IGPUFence::E_CREATE_FLAGS>(0));
 		gpuComputeFence = logicalDevice->createFence(static_cast<video::IGPUFence::E_CREATE_FLAGS>(0));
@@ -256,7 +270,6 @@ public:
 		std::array<IGPUSpecializedShader*, 2> gpuShaders = { gpuVertexShader.get(), gpuFragmentShader.get() };
 
 		size_t ds0SamplerBinding = 0, ds1UboBinding = 0;
-		auto createAndGetUsefullData = [&](asset::IGeometryCreator::return_type& geometryObject)
 		{
 			/*
 				SBinding for the texture (sampler).
@@ -293,19 +306,16 @@ public:
 
 				We know ahead of time that `SBasicViewParameters` struct is the expected structure of the only UBO block in the descriptor set nr. 1 of the shader.
 			*/
+			{
+				IGPUBuffer::SCreationParams creationParams = {};
+				creationParams.usage = core::bitflag(asset::IBuffer::EUF_UNIFORM_BUFFER_BIT)|asset::IBuffer::EUF_TRANSFER_DST_BIT|asset::IBuffer::EUF_INLINE_UPDATE_VIA_CMDBUF;
+				creationParams.size = sizeof(SBasicViewParameters);
+				gpuubo = logicalDevice->createBuffer(std::move(creationParams));
 
-			IGPUBuffer::SCreationParams creationParams = {};
-			creationParams.canUpdateSubRange = true;
-			creationParams.usage = core::bitflag(asset::IBuffer::EUF_UNIFORM_BUFFER_BIT)|asset::IBuffer::EUF_TRANSFER_DST_BIT;
-			IDeviceMemoryBacked::SDeviceMemoryRequirements memReq;
-			memReq.vulkanReqs.size = sizeof(SBasicViewParameters);
-			memReq.vulkanReqs.alignment = physicalDevice->getLimits().UBOAlignment;
-			memReq.vulkanReqs.memoryTypeBits = 0xffffffffu;
-			memReq.memoryHeapLocation = IDeviceMemoryAllocation::ESMT_DEVICE_LOCAL;
-			memReq.mappingCapability = IDeviceMemoryAllocation::EMAF_NONE;
-			memReq.prefersDedicatedAllocation = true;
-			memReq.requiresDedicatedAllocation = true;
-			gpuubo = logicalDevice->createGPUBufferOnDedMem(creationParams,memReq);
+				IDeviceMemoryBacked::SDeviceMemoryRequirements memReq = gpuubo->getMemoryReqs();
+				memReq.memoryTypeBits &= physicalDevice->getDeviceLocalMemoryTypeBits();
+				logicalDevice->allocate(memReq, gpuubo.get());
+			}
 
 			/*
 				Creating descriptor sets - texture (sampler) and basic view parameters (UBO).
@@ -316,7 +326,7 @@ public:
 
 			auto descriptorPool = createDescriptorPool(1u);
 
-			auto gpuDescriptorSet3 = logicalDevice->createDescriptorSet(descriptorPool.get(), gpuDs3Layout);
+			gpuDescriptorSet3 = logicalDevice->createDescriptorSet(descriptorPool.get(), gpuDs3Layout);
 			{
 				video::IGPUDescriptorSet::SWriteDescriptorSet write;
 				write.dstSet = gpuDescriptorSet3.get();
@@ -328,13 +338,13 @@ public:
 				{
 					info.desc = std::move(gpuImageView);
 					ISampler::SParams samplerParams = { ISampler::ETC_CLAMP_TO_EDGE,ISampler::ETC_CLAMP_TO_EDGE,ISampler::ETC_CLAMP_TO_EDGE,ISampler::ETBC_FLOAT_OPAQUE_BLACK,ISampler::ETF_LINEAR,ISampler::ETF_LINEAR,ISampler::ESMM_LINEAR,0u,false,ECO_ALWAYS };
-					info.image = { logicalDevice->createSampler(samplerParams),EIL_SHADER_READ_ONLY_OPTIMAL };
+					info.image = { logicalDevice->createSampler(samplerParams),IGPUImage::EL_SHADER_READ_ONLY_OPTIMAL };
 				}
 				write.info = &info;
 				logicalDevice->updateDescriptorSets(1u, &write, 0u, nullptr);
 			}
 
-			auto gpuDescriptorSet1 = logicalDevice->createDescriptorSet(descriptorPool.get(), gpuDs1Layout);
+			gpuDescriptorSet1 = logicalDevice->createDescriptorSet(descriptorPool.get(), gpuDs1Layout);
 			{
 				video::IGPUDescriptorSet::SWriteDescriptorSet write;
 				write.dstSet = gpuDescriptorSet1.get();
@@ -369,12 +379,12 @@ public:
 				Attaching vertex shader and fragment shaders.
 			*/
 
-			auto gpuPipeline = logicalDevice->createRenderpassIndependentPipeline(nullptr, std::move(gpuPipelineLayout), gpuShaders.data(), gpuShaders.data() + gpuShaders.size(), geometryObject.inputParams, blendParams, geometryObject.assemblyParams, rasterParams);
+			gpuRenderpassIndependentPipeline = logicalDevice->createRenderpassIndependentPipeline(nullptr, std::move(gpuPipelineLayout), gpuShaders.data(), gpuShaders.data() + gpuShaders.size(), rectangleGeometry.inputParams, blendParams, rectangleGeometry.assemblyParams, rasterParams);
 
 			nbl::video::IGPUGraphicsPipeline::SCreationParams graphicsPipelineParams;
-			graphicsPipelineParams.renderpassIndependent = core::smart_refctd_ptr<nbl::video::IGPURenderpassIndependentPipeline>(gpuPipeline.get());
+			graphicsPipelineParams.renderpassIndependent = core::smart_refctd_ptr<nbl::video::IGPURenderpassIndependentPipeline>(gpuRenderpassIndependentPipeline.get());
 			graphicsPipelineParams.renderpass = core::smart_refctd_ptr(renderpass);
-			auto gpuGraphicsPipeline = logicalDevice->createGraphicsPipeline(nullptr, std::move(graphicsPipelineParams));
+			gpuGraphicsPipeline = logicalDevice->createGraphicsPipeline(nullptr, std::move(graphicsPipelineParams));
 
 			core::vectorSIMDf cameraPosition(-5, 0, 0);
 			matrix4SIMD projectionMatrix = matrix4SIMD::buildProjectionMatrixPerspectiveFovLH(core::radians(60.0f), float(WIN_W) / WIN_H, 0.01, 1000);
@@ -390,11 +400,11 @@ public:
 			cpubuffers.reserve(MAX_DATA_BUFFERS);
 			for (auto i = 0; i < MAX_ATTR_BUF_BINDING_COUNT; i++)
 			{
-				auto buf = geometryObject.bindings[i].buffer.get();
+				auto buf = rectangleGeometry.bindings[i].buffer.get();
 				if (buf)
 					cpubuffers.push_back(buf);
 			}
-			auto cpuindexbuffer = geometryObject.indexBuffer.buffer.get();
+			auto cpuindexbuffer = rectangleGeometry.indexBuffer.buffer.get();
 			if (cpuindexbuffer)
 				cpubuffers.push_back(cpuindexbuffer);
 
@@ -405,7 +415,7 @@ public:
 			asset::SBufferBinding<video::IGPUBuffer> bindings[MAX_DATA_BUFFERS];
 			for (auto i = 0, j = 0; i < MAX_ATTR_BUF_BINDING_COUNT; i++)
 			{
-				if (!geometryObject.bindings[i].buffer)
+				if (!rectangleGeometry.bindings[i].buffer)
 					continue;
 				auto buffPair = gpubuffers->operator[](j++);
 				bindings[i].offset = buffPair->getOffset();
@@ -418,28 +428,18 @@ public:
 				bindings[MAX_ATTR_BUF_BINDING_COUNT].buffer = core::smart_refctd_ptr<video::IGPUBuffer>(buffPair->getBuffer());
 			}
 
-			auto mb = core::make_smart_refctd_ptr<video::IGPUMeshBuffer>(core::smart_refctd_ptr(gpuPipeline), nullptr, bindings, std::move(bindings[MAX_ATTR_BUF_BINDING_COUNT]));
+			gpuMeshBuffer = core::make_smart_refctd_ptr<video::IGPUMeshBuffer>(core::smart_refctd_ptr(gpuRenderpassIndependentPipeline), nullptr, bindings, std::move(bindings[MAX_ATTR_BUF_BINDING_COUNT]));
 			{
-				mb->setIndexType(geometryObject.indexType);
-				mb->setIndexCount(geometryObject.indexCount);
-				mb->setBoundingBox(geometryObject.bbox);
+				gpuMeshBuffer->setIndexType(rectangleGeometry.indexType);
+				gpuMeshBuffer->setIndexCount(rectangleGeometry.indexCount);
+				gpuMeshBuffer->setBoundingBox(rectangleGeometry.bbox);
 			}
+		}
 
-			return std::make_tuple(mb, gpuPipeline, gpuubo, gpuDescriptorSet1, gpuDescriptorSet3, gpuGraphicsPipeline);
-		};
-
-		auto gpuRectangle = createAndGetUsefullData(rectangleGeometry);
-		gpuMeshBuffer = std::get<0>(gpuRectangle);
-		gpuRenderpassIndependentPipeline = std::get<1>(gpuRectangle);
-		gpuubo = std::get<2>(gpuRectangle);
-		gpuDescriptorSet1 = std::get<3>(gpuRectangle);
-		gpuDescriptorSet3 = std::get<4>(gpuRectangle);
-		gpuGraphicsPipeline = std::get<5>(gpuRectangle);
-
-		logicalDevice->createCommandBuffers(commandPools[CommonAPI::InitOutput::EQT_GRAPHICS].get(), video::IGPUCommandBuffer::EL_PRIMARY, FRAMES_IN_FLIGHT, commandBuffers);
-
+		const auto& graphicsCommandPools = commandPools[CommonAPI::InitOutput::EQT_GRAPHICS];
 		for (uint32_t i = 0u; i < FRAMES_IN_FLIGHT; i++)
 		{
+			logicalDevice->createCommandBuffers(graphicsCommandPools[i].get(), video::IGPUCommandBuffer::EL_PRIMARY, 1, commandBuffers+i);
 			imageAcquire[i] = logicalDevice->createSemaphore();
 			renderFinished[i] = logicalDevice->createSemaphore();
 		}
@@ -554,7 +554,7 @@ public:
 			clear[1].depthStencil.depth = 0.f;
 
 			beginInfo.clearValueCount = 2u;
-			beginInfo.framebuffer = fbo[acquiredNextFBO];
+			beginInfo.framebuffer = fbo->begin()[acquiredNextFBO];
 			beginInfo.renderpass = renderpass;
 			beginInfo.renderArea = area;
 			beginInfo.clearValues = clear;
@@ -582,7 +582,7 @@ public:
 		commandBuffer->endRenderPass();
 		commandBuffer->end();
 
-		CommonAPI::Submit(logicalDevice.get(), swapchain.get(), commandBuffer.get(), queues[CommonAPI::InitOutput::EQT_GRAPHICS], imageAcquire[resourceIx].get(), renderFinished[resourceIx].get(), fence.get());
+		CommonAPI::Submit(logicalDevice.get(), commandBuffer.get(), queues[CommonAPI::InitOutput::EQT_GRAPHICS], imageAcquire[resourceIx].get(), renderFinished[resourceIx].get(), fence.get());
 		CommonAPI::Present(logicalDevice.get(), swapchain.get(), queues[CommonAPI::InitOutput::EQT_GRAPHICS], renderFinished[resourceIx].get(), acquiredNextFBO);
 	}
 
